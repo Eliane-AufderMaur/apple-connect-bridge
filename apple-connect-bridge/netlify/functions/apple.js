@@ -67,12 +67,15 @@ export default async (req, context) => {
     const date = searchParams.get("date");
     const appId = searchParams.get("appId");
 
-    if (!date || !appId) {
-      return new Response(
-        JSON.stringify({ error: "Missing query params: date, appId" }),
-        { status: 400 }
-      );
-    }
+// TEMP: list apps to find the correct ASC appId
+if (!date || !appId) {
+  const appsRes = await fetch(`${ASC_BASE}/apps?limit=200`, {
+    headers: { Authorization: `Bearer ${jwt}` }
+  });
+  const apps = await appsRes.json();
+  return new Response(JSON.stringify(apps, null, 2), { status: 200 });
+}
+
 
     const requests = await fetch(
       `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONGOING`,
