@@ -69,19 +69,13 @@ export default async (req, context) => {
 
 const mode = searchParams.get("mode");
 
-// Admin-only: list apps (to find appId) when explicitly requested
-if (mode === "listApps") {
-  const adminKey = searchParams.get("adminKey");
-  if (!adminKey || adminKey !== process.env.ASC_ADMIN_KEY) {
-    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
-  }
-
-  const appsRes = await fetch(`${ASC_BASE}/apps?limit=200`, {
-    headers: { Authorization: `Bearer ${jwt}` }
-  });
-  const apps = await appsRes.json();
-  return new Response(JSON.stringify(apps, null, 2), { status: 200 });
+if (!date || !appId) {
+  return new Response(
+    JSON.stringify({ error: "Missing query params: date, appId" }),
+    { status: 400 }
+  );
 }
+
 
 if (!date || !appId) {
   return new Response(
