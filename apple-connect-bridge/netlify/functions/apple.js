@@ -159,9 +159,11 @@ export default async (req, context) => {
       { headers: { Authorization: `Bearer ${jwt}` } }
     ).then(r => r.json());
 
-    const report = reports.data.find(r =>
-      r.attributes.name.toLowerCase().includes("install")
-    );
+    const report = reports.data.find(r => {
+      const n = (r.attributes?.name || "").toLowerCase();
+      return n.includes("installations") && n.includes("delet");
+    });
+
 
     if (!report) {
       return new Response(
