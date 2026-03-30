@@ -255,12 +255,11 @@ export default async (req, context) => {
 
     // snapshot instances: no daily filtering → fetch all, then we filter manually
     const snapInstances = await fetch(
-      `${ASC_BASE}/analyticsReports/${snapReportId}/instances?filter[granularity]=DAILY`,
-      { headers: { Authorization: `Bearer ${jwt}` } }
-    ).then(r => r.json());
+  `${ASC_BASE}/analyticsReports/${snapReportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
+  { headers: { Authorization: `Bearer ${jwt}` } }
+).then(r => r.json());
 
-    // find the instance with this date
-    const snapInstance = snapInstances.data.find(i => i.attributes.processingDate === date);
+const snapInstance = snapInstances?.data?.[0];
 
     if (!snapInstance) {
       return new Response(
