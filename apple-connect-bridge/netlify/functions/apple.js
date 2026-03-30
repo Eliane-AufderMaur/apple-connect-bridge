@@ -2,7 +2,7 @@
 
 const ASC_BASE = "https://api.appstoreconnect.apple.com/v1";
 
-// Minimum date for historical import (Option B)
+// Minimum date for historical import (Option B: ab 20.06.2025)
 const MIN_DATE = "2025-06-20";
 
 function getEnv(name) {
@@ -11,7 +11,7 @@ function getEnv(name) {
   return v;
 }
 
-// Create JWT for ASC API
+// Create ES256 JWT for Apple API
 async function makeJwt() {
   const ISSUER = getEnv("ASC_ISSUER_ID");
   const KEY_ID = getEnv("ASC_KEY_ID");
@@ -65,40 +65,59 @@ async function makeJwt() {
   return `${unsigned}.${sig}`;
 }
 
-// GZIP decoding for Apple segments
+// GZIP decompress
 async function decompressGzip(buffer) {
   const ds = new DecompressionStream("gzip");
   const stream = new Response(new Blob([buffer]).stream().pipeThrough(ds)).body;
   return await new Response(stream).arrayBuffer();
 }
 
-// Parse .txt.gz for installs and deletions
+// Extract installs + deletions
 function parseTxtGzToTotals(txt) {
   const lines = txt.split("\n").filter(Boolean);
   if (lines.length < 2) return { installs: 0, uninstalls: 0 };
 
-  const header = lines[0].split("\t").map(h => h.toLowerCase());
+  const header = lines[0].split("\t").map(s => s.toLowerCase());
   const eventCol = header.indexOf("event");
   const countCol = header.indexOf("count");
 
-  let installs = 0;
-  let uninstalls = 0;
+  let installs = 0, uninstalls = 0;
 
   for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split("\t");
-    const ev = (cols[eventCol] || "").toLowerCase();
-    const c = Number(cols[countCol] || 0);
+    const parts = lines[i].split("\t");
+    const ev = (parts[eventCol] || "").toLowerCase();
+    const c = Number(parts[countCol] || 0);
 
     if (ev.includes("install")) installs += c;
-    if (ev.includes("delete") || ev.includes("delet")) uninstalls += c;
+    if (ev.includes("delete")) uninstalls += c;
   }
 
   return { installs, uninstalls };
 }
 
-// ===============================================
-// MAIN HANDLER
-// ===============================================
+// Pick correct Installation/Deletion report
+function pickInstDelReportId(reportsJson, preferDetailed = false) {
+  const data = reportsJson?.data || [];
+  const nameLc = str => (str || "").toLowerCase();
+
+  const candidates = data.filter(r =>
+    nameLc(r.attributes?.name).includes("app store installation and deletion")
+  );
+
+  if (!candidates.length) return null;
+
+  const typeToFind = preferDetailed ? "detailed" : "standard";
+
+  const preferred = candidates.find(r =>
+    nameLc(r.attributes?.name).includes(typeToFind)
+  );
+
+  return (preferred || candidates[0]).id;
+}
+
+// ===========================================================
+// MAIN FUNCTION
+// ===========================================================
 export default async (req, context) => {
   const url = new URL(req.url);
   const date = url.searchParams.get("date");
@@ -111,8 +130,8 @@ export default async (req, context) => {
     );
   }
 
+  // Historische Schranke
   if (date < MIN_DATE) {
-    // Out of allowed historical range
     return new Response(
       JSON.stringify({ date, installs: 0, uninstalls: 0, note: "before MIN_DATE" }),
       { status: 200 }
@@ -122,17 +141,18 @@ export default async (req, context) => {
   try {
     const jwt = await makeJwt();
 
-    // -------------------------------------------
-    // 1) Find ONGOING report request or create one
-    // -------------------------------------------
+    // --------------------------------------------------------
+    // 1) ONGOING report request
+    // --------------------------------------------------------
     const ongoingList = await fetch(
       `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONGOING`,
       { headers: { Authorization: `Bearer ${jwt}` } }
     ).then(r => r.json());
 
-    let requestId = ongoingList?.data?.[0]?.id;
+    let ongoingRequestId = ongoingList?.data?.[0]?.id;
 
-    if (!requestId) {
+    // If none exists → create one
+    if (!ongoingRequestId) {
       const created = await fetch(`${ASC_BASE}/analyticsReportRequests`, {
         method: "POST",
         headers: {
@@ -148,87 +168,56 @@ export default async (req, context) => {
         })
       }).then(r => r.json());
 
-      requestId = created.data.id;
+      ongoingRequestId = created.data.id;
     }
 
-    // -------------------------------------------
-    // 2) Get ONGOING report for Installations/Deletions
-    // -------------------------------------------
-    const reports = await fetch(
-      `${ASC_BASE}/analyticsReportRequests/${requestId}/reports?filter[category]=APP_USAGE`,
+    // --------------------------------------------------------
+    // 2) ONGOING Reports → Pick Installation/Deletion
+    // --------------------------------------------------------
+    const ongoingReports = await fetch(
+      `${ASC_BASE}/analyticsReportRequests/${ongoingRequestId}/reports?filter[category]=APP_USAGE`,
       { headers: { Authorization: `Bearer ${jwt}` } }
     ).then(r => r.json());
 
-    const report = reports.data.find(r => {
-      const n = (r.attributes?.name || "").toLowerCase();
-      return n.includes("installations") && n.includes("delet");
-    });
+    const ongoingReportId = pickInstDelReportId(ongoingReports, false);
 
-
-   if (!report) {
-  const debug = url.searchParams.get("debug") === "1";
-  const adminKey = url.searchParams.get("adminKey");
-  const isAdmin = adminKey && adminKey === process.env.ASC_ADMIN_KEY;
-
-  if (debug && isAdmin) {
-    return new Response(
-      JSON.stringify({
-        error: "No installs/deletions report found",
-        availableReports: (reports?.data || []).map(r => ({
-          id: r.id,
-          name: r.attributes?.name,
-          category: r.attributes?.category
-        }))
-      }, null, 2),
-      { status: 200 }
-    );
-  }
-
-  return new Response(
-    JSON.stringify({ error: "No installs/deletions report found" }),
-    { status: 500 }
-  );
-}
-
-
-    const reportId = report.id;
-
-    // -------------------------------------------
-    // 3) Try ONGOING instance for this date
-    // -------------------------------------------
-    const instances = await fetch(
-      `${ASC_BASE}/analyticsReports/${reportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
-      { headers: { Authorization: `Bearer ${jwt}` } }
-    ).then(r => r.json());
-
-    const ongoingInstance = instances?.data?.[0];
-
-    if (ongoingInstance) {
-      // Get segment URLs
-      const segments = await fetch(
-        `${ASC_BASE}/analyticsReportInstances/${ongoingInstance.id}/segments`,
+    // --------------------------------------------------------
+    // 3) Try to fetch ONGOING instance
+    // --------------------------------------------------------
+    if (ongoingReportId) {
+      const instances = await fetch(
+        `${ASC_BASE}/analyticsReports/${ongoingReportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
         { headers: { Authorization: `Bearer ${jwt}` } }
       ).then(r => r.json());
 
-      let installs = 0, uninstalls = 0;
+      const instance = instances?.data?.[0];
 
-      for (const seg of segments.data) {
-        const gz = await fetch(seg.attributes.url).then(r => r.arrayBuffer());
-        const txt = new TextDecoder("utf-8").decode(await decompressGzip(gz));
-        const t = parseTxtGzToTotals(txt);
-        installs += t.installs;
-        uninstalls += t.uninstalls;
+      if (instance) {
+        const segments = await fetch(
+          `${ASC_BASE}/analyticsReportInstances/${instance.id}/segments`,
+          { headers: { Authorization: `Bearer ${jwt}` } }
+        ).then(r => r.json());
+
+        let installs = 0, uninstalls = 0;
+
+        for (const seg of segments.data) {
+          const gz = await fetch(seg.attributes.url).then(r => r.arrayBuffer());
+          const txt = new TextDecoder("utf-8").decode(await decompressGzip(gz));
+          const totals = parseTxtGzToTotals(txt);
+          installs += totals.installs;
+          uninstalls += totals.uninstalls;
+        }
+
+        return new Response(
+          JSON.stringify({ date, installs, uninstalls, source: "ongoing" }),
+          { status: 200 }
+        );
       }
-
-      return new Response(
-        JSON.stringify({ date, installs, uninstalls, source: "ongoing" }),
-        { status: 200 }
-      );
     }
 
-    // -------------------------------------------
-    // 4) ONGOING has no instance → Use ONE_TIME_SNAPSHOT
-    // -------------------------------------------
+    // --------------------------------------------------------
+    // 4) FALLBACK: SNAPSHOT
+    // --------------------------------------------------------
     const snapshotList = await fetch(
       `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONE_TIME_SNAPSHOT`,
       { headers: { Authorization: `Bearer ${jwt}` } }
@@ -237,7 +226,7 @@ export default async (req, context) => {
     let snapshotRequestId = snapshotList?.data?.[0]?.id;
 
     if (!snapshotRequestId) {
-      const createdSnap = await fetch(`${ASC_BASE}/analyticsReportRequests`, {
+      const created = await fetch(`${ASC_BASE}/analyticsReportRequests`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${jwt}`,
@@ -252,35 +241,30 @@ export default async (req, context) => {
         })
       }).then(r => r.json());
 
-      snapshotRequestId = createdSnap.data.id;
+      snapshotRequestId = created.data.id;
     }
 
-    // get reports for snapshot
     const snapReports = await fetch(
       `${ASC_BASE}/analyticsReportRequests/${snapshotRequestId}/reports?filter[category]=APP_USAGE`,
       { headers: { Authorization: `Bearer ${jwt}` } }
     ).then(r => r.json());
 
-    const snapReport = snapReports.data.find(r =>
-      r.attributes.name.toLowerCase().includes("install")
-    );
+    const snapReportId = pickInstDelReportId(snapReports, false);
 
-    if (!snapReport) {
+    if (!snapReportId) {
       return new Response(
-        JSON.stringify({ error: "No snapshot installs report found" }),
+        JSON.stringify({ error: "No installs/deletions snapshot report found" }),
         { status: 500 }
       );
     }
 
-    const snapReportId = snapReport.id;
-
-    // snapshot instances: no daily filtering → fetch all, then we filter manually
+    // Fetch specific snapshot instance
     const snapInstances = await fetch(
-  `${ASC_BASE}/analyticsReports/${snapReportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
-  { headers: { Authorization: `Bearer ${jwt}` } }
-).then(r => r.json());
+      `${ASC_BASE}/analyticsReports/${snapReportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
+      { headers: { Authorization: `Bearer ${jwt}` } }
+    ).then(r => r.json());
 
-const snapInstance = snapInstances?.data?.[0];
+    const snapInstance = snapInstances?.data?.[0];
 
     if (!snapInstance) {
       return new Response(
@@ -289,7 +273,7 @@ const snapInstance = snapInstances?.data?.[0];
       );
     }
 
-    // get its segments
+    // Segments for snapshot
     const snapSegments = await fetch(
       `${ASC_BASE}/analyticsReportInstances/${snapInstance.id}/segments`,
       { headers: { Authorization: `Bearer ${jwt}` } }
@@ -300,9 +284,9 @@ const snapInstance = snapInstances?.data?.[0];
     for (const seg of snapSegments.data) {
       const gz = await fetch(seg.attributes.url).then(r => r.arrayBuffer());
       const txt = new TextDecoder("utf-8").decode(await decompressGzip(gz));
-      const t = parseTxtGzToTotals(txt);
-      installs += t.installs;
-      uninstalls += t.uninstalls;
+      const totals = parseTxtGzToTotals(txt);
+      installs += totals.installs;
+      uninstalls += totals.uninstalls;
     }
 
     return new Response(
