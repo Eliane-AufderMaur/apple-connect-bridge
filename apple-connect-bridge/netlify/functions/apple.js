@@ -2,12 +2,16 @@
 
 const ASC_BASE = "https://api.appstoreconnect.apple.com/v1";
 
+// Minimum date for historical import (Option B)
+const MIN_DATE = "2025-06-20";
+
 function getEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing environment variable: ${name}`);
   return v;
 }
 
+// Create JWT for ASC API
 async function makeJwt() {
   const ISSUER = getEnv("ASC_ISSUER_ID");
   const KEY_ID = getEnv("ASC_KEY_ID");
@@ -16,6 +20,7 @@ async function makeJwt() {
   const pem = PRIVATE_KEY.replace(/-----BEGIN PRIVATE KEY-----/, "")
     .replace(/-----END PRIVATE KEY-----/, "")
     .replace(/\n/g, "");
+
   const raw = Uint8Array.from(atob(pem), c => c.charCodeAt(0));
 
   const key = await crypto.subtle.importKey(
@@ -28,6 +33,7 @@ async function makeJwt() {
 
   const header = { alg: "ES256", kid: KEY_ID, typ: "JWT" };
   const now = Math.floor(Date.now() / 1000);
+
   const payload = {
     iss: ISSUER,
     iat: now,
@@ -59,39 +65,72 @@ async function makeJwt() {
   return `${unsigned}.${sig}`;
 }
 
+// GZIP decoding for Apple segments
+async function decompressGzip(buffer) {
+  const ds = new DecompressionStream("gzip");
+  const stream = new Response(new Blob([buffer]).stream().pipeThrough(ds)).body;
+  return await new Response(stream).arrayBuffer();
+}
+
+// Parse .txt.gz for installs and deletions
+function parseTxtGzToTotals(txt) {
+  const lines = txt.split("\n").filter(Boolean);
+  if (lines.length < 2) return { installs: 0, uninstalls: 0 };
+
+  const header = lines[0].split("\t").map(h => h.toLowerCase());
+  const eventCol = header.indexOf("event");
+  const countCol = header.indexOf("count");
+
+  let installs = 0;
+  let uninstalls = 0;
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split("\t");
+    const ev = (cols[eventCol] || "").toLowerCase();
+    const c = Number(cols[countCol] || 0);
+
+    if (ev.includes("install")) installs += c;
+    if (ev.includes("delete") || ev.includes("delet")) uninstalls += c;
+  }
+
+  return { installs, uninstalls };
+}
+
+// ===============================================
+// MAIN HANDLER
+// ===============================================
 export default async (req, context) => {
+  const url = new URL(req.url);
+  const date = url.searchParams.get("date");
+  const appId = url.searchParams.get("appId");
+
+  if (!date || !appId) {
+    return new Response(
+      JSON.stringify({ error: "Missing query params: date, appId" }),
+      { status: 400 }
+    );
+  }
+
+  if (date < MIN_DATE) {
+    // Out of allowed historical range
+    return new Response(
+      JSON.stringify({ date, installs: 0, uninstalls: 0, note: "before MIN_DATE" }),
+      { status: 200 }
+    );
+  }
+
   try {
     const jwt = await makeJwt();
 
-    const { searchParams } = new URL(req.url);
-    const date = searchParams.get("date");
-    const appId = searchParams.get("appId");
-
-const mode = searchParams.get("mode");
-
-if (!date || !appId) {
-  return new Response(
-    JSON.stringify({ error: "Missing query params: date, appId" }),
-    { status: 400 }
-  );
-}
-
-
-if (!date || !appId) {
-  return new Response(
-    JSON.stringify({ error: "Missing query params: date, appId" }),
-    { status: 400 }
-  );
-}
-
-
-
-    const requests = await fetch(
+    // -------------------------------------------
+    // 1) Find ONGOING report request or create one
+    // -------------------------------------------
+    const ongoingList = await fetch(
       `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONGOING`,
       { headers: { Authorization: `Bearer ${jwt}` } }
     ).then(r => r.json());
 
-    let requestId = requests?.data?.[0]?.id;
+    let requestId = ongoingList?.data?.[0]?.id;
 
     if (!requestId) {
       const created = await fetch(`${ASC_BASE}/analyticsReportRequests`, {
@@ -112,6 +151,9 @@ if (!date || !appId) {
       requestId = created.data.id;
     }
 
+    // -------------------------------------------
+    // 2) Get ONGOING report for Installations/Deletions
+    // -------------------------------------------
     const reports = await fetch(
       `${ASC_BASE}/analyticsReportRequests/${requestId}/reports?filter[category]=APP_USAGE`,
       { headers: { Authorization: `Bearer ${jwt}` } }
@@ -123,70 +165,132 @@ if (!date || !appId) {
 
     if (!report) {
       return new Response(
-        JSON.stringify({ error: "Installations report not found" }),
+        JSON.stringify({ error: "No installs/deletions report found" }),
         { status: 500 }
       );
     }
 
     const reportId = report.id;
 
+    // -------------------------------------------
+    // 3) Try ONGOING instance for this date
+    // -------------------------------------------
     const instances = await fetch(
       `${ASC_BASE}/analyticsReports/${reportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
       { headers: { Authorization: `Bearer ${jwt}` } }
     ).then(r => r.json());
 
-    const instance = instances?.data?.[0];
+    const ongoingInstance = instances?.data?.[0];
 
-    if (!instance) {
+    if (ongoingInstance) {
+      // Get segment URLs
+      const segments = await fetch(
+        `${ASC_BASE}/analyticsReportInstances/${ongoingInstance.id}/segments`,
+        { headers: { Authorization: `Bearer ${jwt}` } }
+      ).then(r => r.json());
+
+      let installs = 0, uninstalls = 0;
+
+      for (const seg of segments.data) {
+        const gz = await fetch(seg.attributes.url).then(r => r.arrayBuffer());
+        const txt = new TextDecoder("utf-8").decode(await decompressGzip(gz));
+        const t = parseTxtGzToTotals(txt);
+        installs += t.installs;
+        uninstalls += t.uninstalls;
+      }
+
       return new Response(
-        JSON.stringify({ date, installs: 0, uninstalls: 0, note: "no instance" }),
+        JSON.stringify({ date, installs, uninstalls, source: "ongoing" }),
         { status: 200 }
       );
     }
 
-    const segments = await fetch(
-      `${ASC_BASE}/analyticsReportInstances/${instance.id}/segments`,
+    // -------------------------------------------
+    // 4) ONGOING has no instance → Use ONE_TIME_SNAPSHOT
+    // -------------------------------------------
+    const snapshotList = await fetch(
+      `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONE_TIME_SNAPSHOT`,
       { headers: { Authorization: `Bearer ${jwt}` } }
     ).then(r => r.json());
 
-    let installs = 0;
-    let uninstalls = 0;
+    let snapshotRequestId = snapshotList?.data?.[0]?.id;
 
-    for (const seg of segments.data) {
-      const url = seg.attributes.url;
-      const gz = await fetch(url).then(r => r.arrayBuffer());
+    if (!snapshotRequestId) {
+      const createdSnap = await fetch(`${ASC_BASE}/analyticsReportRequests`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          data: {
+            type: "analyticsReportRequests",
+            attributes: { accessType: "ONE_TIME_SNAPSHOT" },
+            relationships: { app: { data: { type: "apps", id: appId } } }
+          }
+        })
+      }).then(r => r.json());
 
+      snapshotRequestId = createdSnap.data.id;
+    }
+
+    // get reports for snapshot
+    const snapReports = await fetch(
+      `${ASC_BASE}/analyticsReportRequests/${snapshotRequestId}/reports?filter[category]=APP_USAGE`,
+      { headers: { Authorization: `Bearer ${jwt}` } }
+    ).then(r => r.json());
+
+    const snapReport = snapReports.data.find(r =>
+      r.attributes.name.toLowerCase().includes("install")
+    );
+
+    if (!snapReport) {
+      return new Response(
+        JSON.stringify({ error: "No snapshot installs report found" }),
+        { status: 500 }
+      );
+    }
+
+    const snapReportId = snapReport.id;
+
+    // snapshot instances: no daily filtering → fetch all, then we filter manually
+    const snapInstances = await fetch(
+      `${ASC_BASE}/analyticsReports/${snapReportId}/instances?filter[granularity]=DAILY`,
+      { headers: { Authorization: `Bearer ${jwt}` } }
+    ).then(r => r.json());
+
+    // find the instance with this date
+    const snapInstance = snapInstances.data.find(i => i.attributes.processingDate === date);
+
+    if (!snapInstance) {
+      return new Response(
+        JSON.stringify({ date, installs: 0, uninstalls: 0, note: "snapshot-no-instance" }),
+        { status: 200 }
+      );
+    }
+
+    // get its segments
+    const snapSegments = await fetch(
+      `${ASC_BASE}/analyticsReportInstances/${snapInstance.id}/segments`,
+      { headers: { Authorization: `Bearer ${jwt}` } }
+    ).then(r => r.json());
+
+    let installs = 0, uninstalls = 0;
+
+    for (const seg of snapSegments.data) {
+      const gz = await fetch(seg.attributes.url).then(r => r.arrayBuffer());
       const txt = new TextDecoder("utf-8").decode(await decompressGzip(gz));
-      const lines = txt.split("\n").map(l => l.trim()).filter(Boolean);
-
-      if (lines.length < 2) continue;
-
-      const header = lines[0].split("\t").map(s => s.toLowerCase());
-      const eventCol = header.indexOf("event");
-      const countCol = header.indexOf("count");
-
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split("\t");
-        const event = cols[eventCol]?.toLowerCase() || "";
-        const count = Number(cols[countCol] || 0);
-        if (event.includes("install")) installs += count;
-        if (event.includes("delete")) uninstalls += count;
-      }
+      const t = parseTxtGzToTotals(txt);
+      installs += t.installs;
+      uninstalls += t.uninstalls;
     }
 
     return new Response(
-      JSON.stringify({ date, installs, uninstalls }),
+      JSON.stringify({ date, installs, uninstalls, source: "snapshot" }),
       { status: 200 }
     );
+
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
-      status: 500
-    });
+    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
   }
 };
-
-async function decompressGzip(buffer) {
-  const ds = new DecompressionStream("gzip");
-  const stream = new Response(new Blob([buffer]).stream().pipeThrough(ds)).body;
-  return await new Response(stream).arrayBuffer();
-}
