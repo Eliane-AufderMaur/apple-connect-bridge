@@ -165,12 +165,31 @@ export default async (req, context) => {
     });
 
 
-    if (!report) {
-      return new Response(
-        JSON.stringify({ error: "No installs/deletions report found" }),
-        { status: 500 }
-      );
-    }
+   if (!report) {
+  const debug = url.searchParams.get("debug") === "1";
+  const adminKey = url.searchParams.get("adminKey");
+  const isAdmin = adminKey && adminKey === process.env.ASC_ADMIN_KEY;
+
+  if (debug && isAdmin) {
+    return new Response(
+      JSON.stringify({
+        error: "No installs/deletions report found",
+        availableReports: (reports?.data || []).map(r => ({
+          id: r.id,
+          name: r.attributes?.name,
+          category: r.attributes?.category
+        }))
+      }, null, 2),
+      { status: 200 }
+    );
+  }
+
+  return new Response(
+    JSON.stringify({ error: "No installs/deletions report found" }),
+    { status: 500 }
+  );
+}
+
 
     const reportId = report.id;
 
