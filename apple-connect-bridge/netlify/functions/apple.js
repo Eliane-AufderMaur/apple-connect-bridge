@@ -1,6 +1,6 @@
 // apple-connect-bridge/netlify/functions/apple.js
 // UI Installations & UI Deletions via SalesReports (Units / Returns)
-// Robust: ES256 JWT + gzip (TSV) parsing + optional appId filter + debug
+// Robust: ES256 JWT + gzip (TSV) parsing + correct SUBTYPE=SUMMARY
 
 const crypto = require("crypto");
 const zlib = require("zlib");
@@ -39,7 +39,6 @@ function makeJwt() {
   s = s.replace(/^"(.*)"$/s, "$1").replace(/^'(.*)'$/s, "$1");
   s = s.replace(/\\n/g, "\n");
 
-  // Accept PEM or base64 body
   const stripped = s
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
@@ -81,26 +80,26 @@ function findColIndex(cols, names) {
 
 exports.handler = async (event) => {
   const qs = event.queryStringParameters || {};
-  const date = qs.date; // YYYY-MM-DD
+  const date = qs.date;
   const debug = qs.debug === "1";
 
-  const vendorNumber = process.env.APPLE_VENDOR_NUMBER; // set in Netlify env vars
-  const appId = qs.appId || process.env.APPLE_APP_ID;   // optional filter
+  const vendorNumber = process.env.APPLE_VENDOR_NUMBER;
+  const appId = qs.appId || process.env.APPLE_APP_ID;
 
   if (!date) return json(400, { error: "Missing query param: date (YYYY-MM-DD)" });
-  if (!vendorNumber) return json(500, { error: "Missing env var: APPLE_VENDOR_NUMBER" });
 
   try {
     const jwt = makeJwt();
 
+    // IMPORTANT: SUMMARY subtype is required to get "Units" AND "Returns"
     const url =
       `${ASC_BASE}/salesReports` +
       `?filter[frequency]=DAILY` +
       `&filter[reportType]=SALES` +
-      `&filter[reportSubType]=SUMMARY` +
+      `&filter[reportSubType]=SUMMARY` +     // <-- missing before
+      `&filter[version]=1_0` +
       `&filter[reportDate]=${encodeURIComponent(date)}` +
-      `&filter[vendorNumber]=${encodeURIComponent(vendorNumber)}` +
-      `&filter[version]=1_0`;
+      `&filter[vendorNumber]=${encodeURIComponent(vendorNumber)}`;
 
     const res = await fetch(url, {
       headers: {
@@ -117,7 +116,6 @@ exports.handler = async (event) => {
     const ab = await res.arrayBuffer();
     const raw = Buffer.from(ab);
 
-    // SalesReports is gzipped
     let txt;
     try {
       txt = zlib.gunzipSync(raw).toString("utf-8");
@@ -131,17 +129,18 @@ exports.handler = async (event) => {
     }
 
     const headerLine = lines[0];
-    const delim = headerLine.includes("\t") ? "\t" : ","; // usually TSV
+    const delim = headerLine.includes("\t") ? "\t" : ",";
     const cols = headerLine.split(delim).map((s) => s.trim());
 
+    // MUST exist in SUMMARY report
     const idxUnits = findColIndex(cols, ["Units"]);
     const idxReturns = findColIndex(cols, ["Returns"]);
-    const idxAppleId = findColIndex(cols, ["Apple Identifier", "App Apple Identifier"]);
+    const idxAppleId = findColIndex(cols, ["Apple Identifier"]);
 
     if (idxUnits < 0 || idxReturns < 0) {
       return json(500, {
         date,
-        error: "Could not find Units/Returns columns in SalesReport",
+        error: "Could not find Units/Returns columns in SUMMARY report",
         header: cols,
         source: "salesReports",
       });
@@ -166,7 +165,6 @@ exports.handler = async (event) => {
 
     return json(200, {
       date,
-      appId: appId || null,
       installs,
       uninstalls,
       source: "salesReports",
@@ -174,7 +172,6 @@ exports.handler = async (event) => {
         ? {
             debug: {
               url,
-              delimiter: delim === "\t" ? "\\t" : ",",
               header: cols,
               matchedRows,
               sampleLines: lines.slice(0, 5),
@@ -182,6 +179,7 @@ exports.handler = async (event) => {
           }
         : {}),
     });
+
   } catch (e) {
     return json(500, { date, error: e.message, source: "salesReports" });
   }
