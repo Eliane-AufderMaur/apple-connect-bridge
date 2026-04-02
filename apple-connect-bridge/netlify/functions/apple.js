@@ -35,8 +35,30 @@ function makeJwt() {
   const ISSUER = getEnv("ASC_ISSUER_ID");
   const KEY_ID = getEnv("ASC_KEY_ID");
 
-  // Netlify env vars often store newlines as \n
-  const PRIVATE_KEY = getEnv("ASC_PRIVATE_KEY").replace(/\\n/g, "\n");
+  // Raw value from Netlify env var (can be PEM or base64 body, may contain \n)
+  let s = String(getEnv("ASC_PRIVATE_KEY")).trim();
+
+  // remove surrounding quotes if someone pasted them
+  s = s.replace(/^"(.*)"$/s, "$1").replace(/^'(.*)'$/s, "$1");
+
+  // convert literal \n into real newlines
+  s = s.replace(/\\n/g, "\n");
+
+  // remove PEM armor if present and all whitespace
+  s = s
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\s+/g, "");
+
+  let keyObj;
+  try {
+    const der = Buffer.from(s, "base64");
+    keyObj = crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  } catch (e) {
+    throw new Error(
+      `ASC_PRIVATE_KEY cannot be parsed. Make sure it is the Apple .p8 private key (PKCS#8), stored as PEM or base64 body. Details: ${e.message}`
+    );
+  }
 
   const header = { alg: "ES256", kid: KEY_ID, typ: "JWT" };
   const now = Math.floor(Date.now() / 1000);
@@ -50,12 +72,13 @@ function makeJwt() {
   const unsigned = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
 
   const sig = crypto.sign("sha256", Buffer.from(unsigned), {
-    key: PRIVATE_KEY,
+    key: keyObj,
     dsaEncoding: "ieee-p1363",
   });
 
   return `${unsigned}.${base64url(sig)}`;
 }
+
 
 function gunzipAsync(buffer) {
   return new Promise((resolve, reject) => {
