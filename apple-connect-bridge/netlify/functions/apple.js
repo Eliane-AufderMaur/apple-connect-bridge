@@ -299,8 +299,59 @@ exports.handler = async (event) => {
     const snapInstance = snapInstances?.data?.[0];
 
     if (!snapInstance) {
-      return json(200, { date, installs: 0, uninstalls: 0, note: "snapshot-no-instance", ...(debug ? { debugCalls } : {}) });
+  let snapAllDaily = null;
+  let ongAllDaily = null;
+
+  // Nur im Debug-Modus: verfügbare Daily-Instances listen
+  if (debug) {
+    try {
+      snapAllDaily = await ascFetchJson(
+        `${ASC_BASE}/analyticsReports/${snapReportId}/instances?filter[granularity]=DAILY&limit=200`,
+        jwt,
+        debugCalls
+      );
+    } catch (e) {
+      snapAllDaily = { error: e.message };
     }
+
+    if (ongoingReportId) {
+      try {
+        ongAllDaily = await ascFetchJson(
+          `${ASC_BASE}/analyticsReports/${ongoingReportId}/instances?filter[granularity]=DAILY&limit=200`,
+          jwt,
+          debugCalls
+        );
+      } catch (e) {
+        ongAllDaily = { error: e.message };
+      }
+    }
+  }
+
+  return json(200, {
+    date,
+    installs: 0,
+    uninstalls: 0,
+    note: "snapshot-no-instance",
+    ...(debug
+      ? {
+          snapshotReportId: snapReportId,
+          ongoingReportId,
+          snapshotDailyInstancesTotal: snapAllDaily?.meta?.paging?.total ?? null,
+          snapshotDailyProcessingDates: (snapAllDaily?.data || [])
+            .map((x) => x.attributes?.processingDate)
+            .filter(Boolean)
+            .slice(0, 60),
+          ongoingDailyInstancesTotal: ongAllDaily?.meta?.paging?.total ?? null,
+          ongoingDailyProcessingDates: (ongAllDaily?.data || [])
+            .map((x) => x.attributes?.processingDate)
+            .filter(Boolean)
+            .slice(0, 60),
+          debugCalls,
+        }
+      : {}),
+  });
+}
+
 
     const snapSegments = await ascFetchJson(
       `${ASC_BASE}/analyticsReportInstances/${snapInstance.id}/segments`,
