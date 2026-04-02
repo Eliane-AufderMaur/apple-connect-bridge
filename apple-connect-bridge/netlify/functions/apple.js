@@ -246,6 +246,14 @@ exports.handler = async (event) => {
           const gzBuf = Buffer.from(ab);
           const txtBuf = await gunzipAsync(gzBuf);
           const totals = parseTxtGzToTotals(txtBuf.toString("utf-8"));
+          if (debug && !globalThis.__sampleShown) {
+            globalThis.__sampleShown = true;
+            const txt = txtBuf.toString("utf-8");
+            const sampleLines = txt.split("\n").slice(0, 5);
+            // Debug-Call "fake" anhängen, damit es in debugCalls sichtbar ist
+            debugCalls.push({ sampleLines });
+            }
+
           installs += totals.installs;
           uninstalls += totals.uninstalls;
         }
