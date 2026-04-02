@@ -5,6 +5,29 @@ const ASC_BASE = "https://api.appstoreconnect.apple.com/v1";
 // Minimum date for historical import (Option B: ab 20.06.2025)
 const MIN_DATE = "2025-06-20";
 
+async function ascFetchJson(url, jwt, debugCalls) {
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${jwt}` } });
+  const text = await res.text();
+
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+  if (debugCalls) {
+    debugCalls.push({
+      url,
+      status: res.status,
+      ok: res.ok,
+      bodyPreview: text.slice(0, 500)
+    });
+  }
+
+  if (!res.ok) throw new Error(`ASC HTTP ${res.status} for ${url}: ${text.slice(0, 500)}`);
+  if (json?.errors?.length) throw new Error(`ASC errors for ${url}: ${JSON.stringify(json.errors).slice(0, 500)}`);
+
+  return json;
+}
+
+
 function getEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing environment variable: ${name}`);
@@ -122,6 +145,9 @@ export default async (req, context) => {
   const url = new URL(req.url);
   const date = url.searchParams.get("date");
   const appId = url.searchParams.get("appId");
+  const debug = url.searchParams.get("debug") === "1";
+  const debugCalls = debug ? [] : null;
+
 
   if (!date || !appId) {
     return new Response(
@@ -144,10 +170,12 @@ export default async (req, context) => {
     // --------------------------------------------------------
     // 1) ONGOING report request
     // --------------------------------------------------------
-    const ongoingList = await fetch(
-      `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONGOING`,
-      { headers: { Authorization: `Bearer ${jwt}` } }
-    ).then(r => r.json());
+    const ongoingList = await ascFetchJson(
+  `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONGOING`,
+  jwt,
+  debugCalls
+);
+
 
     let ongoingRequestId = ongoingList?.data?.[0]?.id;
 
@@ -294,7 +322,8 @@ export default async (req, context) => {
       { status: 200 }
     );
 
-  } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
-  }
-};
+  return new Response(
+  JSON.stringify({ error: err.message, debugCalls }),
+  { status: 500 }
+);
+
