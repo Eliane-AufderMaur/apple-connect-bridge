@@ -1,6 +1,6 @@
 // apple-connect-bridge/netlify/functions/apple.js
 // UI Installations & UI Deletions via SalesReports (Units / Returns)
-// Robust: ES256 JWT + gzip (TSV) parsing + optional appId filter + debug
+// Robust: ES256 JWT + gzip (TSV) parsing + debug
 
 const crypto = require("crypto");
 const zlib = require("zlib");
@@ -84,8 +84,8 @@ exports.handler = async (event) => {
   const date = qs.date; // YYYY-MM-DD
   const debug = qs.debug === "1";
 
-  const vendorNumber = process.env.APPLE_VENDOR_NUMBER; // set in Netlify env vars
-  const appId = qs.appId || process.env.APPLE_APP_ID;   // optional filter
+  const vendorNumber = process.env.APPLE_VENDOR_NUMBER;
+  const appId = qs.appId || process.env.APPLE_APP_ID;
 
   if (!date) return json(400, { error: "Missing query param: date (YYYY-MM-DD)" });
   if (!vendorNumber) return json(500, { error: "Missing env var: APPLE_VENDOR_NUMBER" });
