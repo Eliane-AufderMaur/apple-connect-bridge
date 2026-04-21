@@ -1,11 +1,15 @@
 // apple-connect-bridge/netlify/functions/apple.js
-// UI Installations & UI Deletions via SalesReports (Units / Returns)
-// Robust: ES256 JWT + gzip (TSV) parsing + debug
+// App Store Connect Analytics Reports API
+// Liefert tägliche Installations- und Deletions-Werte aus dem
+// "App Store Installations and Deletions Report".
+// Hinweis: Diese Daten basieren auf opt-in Usage-Daten und können
+// von der UI in App Store Connect abweichen.
 
 const crypto = require("crypto");
 const zlib = require("zlib");
 
 const ASC_BASE = "https://api.appstoreconnect.apple.com/v1";
+const MIN_DATE = "2025-06-20";
 
 function json(statusCode, obj) {
   return {
@@ -30,7 +34,6 @@ function base64url(input) {
     .replace(/=+$/g, "");
 }
 
-// ES256 JWT for App Store Connect API
 function makeJwt() {
   const ISSUER = getEnv("ASC_ISSUER_ID");
   const KEY_ID = getEnv("ASC_KEY_ID");
@@ -39,17 +42,20 @@ function makeJwt() {
   s = s.replace(/^"(.*)"$/s, "$1").replace(/^'(.*)'$/s, "$1");
   s = s.replace(/\\n/g, "\n");
 
-  // Accept PEM or base64 body
-  const stripped = s
+  s = s
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
     .replace(/\s+/g, "");
 
-  const keyObj = crypto.createPrivateKey({
-    key: Buffer.from(stripped, "base64"),
-    format: "der",
-    type: "pkcs8",
-  });
+  let keyObj;
+  try {
+    const der = Buffer.from(s, "base64");
+    keyObj = crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  } catch (e) {
+    throw new Error(
+      `ASC_PRIVATE_KEY cannot be parsed. Must be Apple .p8 PKCS#8. Details: ${e.message}`
+    );
+  }
 
   const header = { alg: "ES256", kid: KEY_ID, typ: "JWT" };
   const now = Math.floor(Date.now() / 1000);
@@ -60,7 +66,9 @@ function makeJwt() {
     aud: "appstoreconnect-v1",
   };
 
-  const unsigned = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+  const unsigned = `${base64url(JSON.stringify(header))}.${base64url(
+    JSON.stringify(payload))
+  }`;
 
   const sig = crypto.sign("sha256", Buffer.from(unsigned), {
     key: keyObj,
@@ -70,119 +78,353 @@ function makeJwt() {
   return `${unsigned}.${base64url(sig)}`;
 }
 
-function findColIndex(cols, names) {
-  const lc = cols.map((c) => String(c || "").trim().toLowerCase());
-  for (const n of names) {
-    const i = lc.indexOf(String(n).toLowerCase());
-    if (i >= 0) return i;
+function gunzipAsync(buffer) {
+  return new Promise((resolve, reject) => {
+    zlib.gunzip(buffer, (err, out) => (err ? reject(err) : resolve(out)));
+  });
+}
+
+function parseTxtGzToTotals(txt, options = {}) {
+  const { excludeUpdates = false } = options;
+
+  const lines = txt.split("\n").filter(Boolean);
+  if (lines.length < 2) {
+    return { installs: 0, uninstalls: 0, downloadTypeStats: {} };
   }
-  return -1;
+
+  const header = lines[0].split("\t").map((s) => s.trim());
+  const headerLc = header.map((s) => s.toLowerCase());
+  const idx = (name) => headerLc.indexOf(String(name).toLowerCase());
+
+  const eventCol = idx("event");
+  const countsCol = headerLc.includes("counts") ? idx("counts") : idx("count");
+  const downloadTypeCol = idx("download type");
+
+  if (eventCol < 0 || countsCol < 0) {
+    return {
+      installs: 0,
+      uninstalls: 0,
+      downloadTypeStats: { _error: "missing event/counts column" },
+    };
+  }
+
+  let installs = 0;
+  let uninstalls = 0;
+  const downloadTypeStats = {};
+
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split("\t");
+
+    const ev = (parts[eventCol] || "").toLowerCase();
+    const c = Number(parts[countsCol] || 0);
+
+    const dt =
+      downloadTypeCol >= 0 ? String(parts[downloadTypeCol] || "").trim() : "";
+
+    if (dt) {
+      downloadTypeStats[dt] = (downloadTypeStats[dt] || 0) + c;
+    }
+
+    if (excludeUpdates && dt.toLowerCase().includes("update")) continue;
+
+    if (ev.includes("install")) installs += c;
+    if (ev.includes("delete")) uninstalls += c;
+  }
+
+  return { installs, uninstalls, downloadTypeStats };
+}
+
+async function ascFetchJson(url, jwt, debugCalls, options = {}) {
+  const res = await fetch(url, {
+    method: options.method || "GET",
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+
+  const text = await res.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+
+  if (debugCalls) {
+    debugCalls.push({
+      url,
+      status: res.status,
+      ok: res.ok,
+      bodyPreview: String(text).slice(0, 800),
+    });
+  }
+
+  if (!res.ok) {
+    throw new Error(
+      `ASC HTTP ${res.status} for ${url}: ${String(text).slice(0, 800)}`
+    );
+  }
+
+  if (data?.errors?.length) {
+    throw new Error(
+      `ASC errors for ${url}: ${JSON.stringify(data.errors).slice(0, 800)}`
+    );
+  }
+
+  return data;
+}
+
+function pickInstDelReportId(reportsJson) {
+  const data = reportsJson?.data || [];
+  const nameLc = (s) => (s || "").toLowerCase();
+
+  const candidates = data.filter((r) =>
+    nameLc(r.attributes?.name).includes("installation and deletion")
+  );
+
+  return candidates[0]?.id || null;
 }
 
 exports.handler = async (event) => {
   const qs = event.queryStringParameters || {};
-  const date = qs.date; // YYYY-MM-DD
-  const debug = qs.debug === "1";
-
-  const vendorNumber = process.env.APPLE_VENDOR_NUMBER;
+  const date = qs.date;
   const appId = qs.appId || process.env.APPLE_APP_ID;
+  const debug = qs.debug === "1";
+  const excludeUpdates = qs.excludeUpdates === "1";
+  const debugCalls = debug ? [] : null;
 
-  if (!date) return json(400, { error: "Missing query param: date (YYYY-MM-DD)" });
-  if (!vendorNumber) return json(500, { error: "Missing env var: APPLE_VENDOR_NUMBER" });
+  if (!date) {
+    return json(400, { error: "Missing query param: date (YYYY-MM-DD)" });
+  }
+
+  if (!appId) {
+    return json(400, { error: "Missing appId query param or APPLE_APP_ID env var" });
+  }
+
+  if (date < MIN_DATE) {
+    return json(200, {
+      date,
+      appId,
+      installs: 0,
+      uninstalls: 0,
+      note: "before MIN_DATE",
+    });
+  }
 
   try {
     const jwt = makeJwt();
 
-    const url =
-      `${ASC_BASE}/salesReports` +
-      `?filter[frequency]=DAILY` +
-      `&filter[reportType]=SALES` +
-      `&filter[reportSubType]=SUMMARY` +
-      `&filter[reportDate]=${encodeURIComponent(date)}` +
-      `&filter[vendorNumber]=${encodeURIComponent(vendorNumber)}` +
-      `&filter[version]=1_0`;
+    const ongoingList = await ascFetchJson(
+      `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONGOING`,
+      jwt,
+      debugCalls
+    );
 
-    const res = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: "application/a-gzip",
-      },
-    });
+    let ongoingRequestId = ongoingList?.data?.[0]?.id;
 
-    if (!res.ok) {
-      const text = await res.text();
-      return json(res.status, { date, error: text.slice(0, 1200), source: "salesReports" });
+    if (!ongoingRequestId) {
+      const created = await ascFetchJson(
+        `${ASC_BASE}/analyticsReportRequests`,
+        jwt,
+        debugCalls,
+        {
+          method: "POST",
+          body: {
+            data: {
+              type: "analyticsReportRequests",
+              attributes: { accessType: "ONGOING" },
+              relationships: {
+                app: { data: { type: "apps", id: appId } },
+              },
+            },
+          },
+        }
+      );
+      ongoingRequestId = created?.data?.id;
     }
 
-    const ab = await res.arrayBuffer();
-    const raw = Buffer.from(ab);
+    let ongoingReportId = null;
 
-    // SalesReports is gzipped
-    let txt;
-    try {
-      txt = zlib.gunzipSync(raw).toString("utf-8");
-    } catch {
-      txt = raw.toString("utf-8");
+    if (ongoingRequestId) {
+      const ongoingReports = await ascFetchJson(
+        `${ASC_BASE}/analyticsReportRequests/${ongoingRequestId}/reports?filter[category]=APP_USAGE`,
+        jwt,
+        debugCalls
+      );
+      ongoingReportId = pickInstDelReportId(ongoingReports);
     }
 
-    const lines = txt.split("\n").filter(Boolean);
-    if (lines.length < 2) {
-      return json(200, { date, installs: 0, uninstalls: 0, note: "no-data", source: "salesReports" });
+    if (ongoingReportId) {
+      const instances = await ascFetchJson(
+        `${ASC_BASE}/analyticsReports/${ongoingReportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
+        jwt,
+        debugCalls
+      );
+
+      const instance = instances?.data?.[0];
+
+      if (instance) {
+        const segments = await ascFetchJson(
+          `${ASC_BASE}/analyticsReportInstances/${instance.id}/segments`,
+          jwt,
+          debugCalls
+        );
+
+        let installs = 0;
+        let uninstalls = 0;
+        let aggregateDownloadTypeStats = {};
+
+        for (const seg of segments.data || []) {
+          const ab = await fetch(seg.attributes.url).then((r) => r.arrayBuffer());
+          const gzBuf = Buffer.from(ab);
+          const txtBuf = await gunzipAsync(gzBuf);
+          const txt = txtBuf.toString("utf-8");
+
+          const totals = parseTxtGzToTotals(txt, { excludeUpdates });
+
+          installs += totals.installs;
+          uninstalls += totals.uninstalls;
+
+          for (const [k, v] of Object.entries(totals.downloadTypeStats || {})) {
+            aggregateDownloadTypeStats[k] = (aggregateDownloadTypeStats[k] || 0) + v;
+          }
+
+          if (debug) {
+            debugCalls.push({
+              sampleLines: txt.split("\n").slice(0, 5),
+            });
+          }
+        }
+
+        return json(200, {
+          date,
+          appId,
+          installs,
+          uninstalls,
+          source: "ongoing",
+          ...(debug ? { debugCalls, downloadTypeStats: aggregateDownloadTypeStats } : {}),
+        });
+      }
     }
 
-    const headerLine = lines[0];
-    const delim = headerLine.includes("\t") ? "\t" : ","; // usually TSV
-    const cols = headerLine.split(delim).map((s) => s.trim());
+    const snapshotList = await ascFetchJson(
+      `${ASC_BASE}/apps/${appId}/analyticsReportRequests?filter[accessType]=ONE_TIME_SNAPSHOT`,
+      jwt,
+      debugCalls
+    );
 
-    const idxUnits = findColIndex(cols, ["Units"]);
-    const idxReturns = findColIndex(cols, ["Returns"]);
-    const idxAppleId = findColIndex(cols, ["Apple Identifier", "App Apple Identifier"]);
+    let snapshotRequestId = snapshotList?.data?.[0]?.id;
 
-    if (idxUnits < 0 || idxReturns < 0) {
-      return json(500, {
+    if (!snapshotRequestId) {
+      const created = await ascFetchJson(
+        `${ASC_BASE}/analyticsReportRequests`,
+        jwt,
+        debugCalls,
+        {
+          method: "POST",
+          body: {
+            data: {
+              type: "analyticsReportRequests",
+              attributes: { accessType: "ONE_TIME_SNAPSHOT" },
+              relationships: {
+                app: { data: { type: "apps", id: appId } },
+              },
+            },
+          },
+        }
+      );
+      snapshotRequestId = created?.data?.id;
+    }
+
+    let snapReportId = null;
+
+    if (snapshotRequestId) {
+      const snapReports = await ascFetchJson(
+        `${ASC_BASE}/analyticsReportRequests/${snapshotRequestId}/reports?filter[category]=APP_USAGE`,
+        jwt,
+        debugCalls
+      );
+      snapReportId = pickInstDelReportId(snapReports);
+    }
+
+    if (!snapReportId) {
+      return json(200, {
         date,
-        error: "Could not find Units/Returns columns in SalesReport",
-        header: cols,
-        source: "salesReports",
+        appId,
+        installs: 0,
+        uninstalls: 0,
+        note: "snapshot-report-not-found",
+        ...(debug ? { debugCalls } : {}),
       });
     }
 
+    const snapInstances = await ascFetchJson(
+      `${ASC_BASE}/analyticsReports/${snapReportId}/instances?filter[processingDate]=${date}&filter[granularity]=DAILY`,
+      jwt,
+      debugCalls
+    );
+
+    const snapInstance = snapInstances?.data?.[0];
+
+    if (!snapInstance) {
+      return json(200, {
+        date,
+        appId,
+        installs: 0,
+        uninstalls: 0,
+        note: "snapshot-no-instance",
+        ...(debug ? { debugCalls } : {}),
+      });
+    }
+
+    const snapSegments = await ascFetchJson(
+      `${ASC_BASE}/analyticsReportInstances/${snapInstance.id}/segments`,
+      jwt,
+      debugCalls
+    );
+
     let installs = 0;
     let uninstalls = 0;
-    let matchedRows = 0;
+    let aggregateDownloadTypeStats = {};
 
-    for (let i = 1; i < lines.length; i++) {
-      const parts = lines[i].split(delim);
+    for (const seg of snapSegments.data || []) {
+      const ab = await fetch(seg.attributes.url).then((r) => r.arrayBuffer());
+      const gzBuf = Buffer.from(ab);
+      const txtBuf = await gunzipAsync(gzBuf);
+      const txt = txtBuf.toString("utf-8");
 
-      if (idxAppleId >= 0 && appId) {
-        const rowAppleId = String(parts[idxAppleId] || "").trim();
-        if (rowAppleId && rowAppleId !== String(appId)) continue;
+      const totals = parseTxtGzToTotals(txt, { excludeUpdates });
+
+      installs += totals.installs;
+      uninstalls += totals.uninstalls;
+
+      for (const [k, v] of Object.entries(totals.downloadTypeStats || {})) {
+        aggregateDownloadTypeStats[k] = (aggregateDownloadTypeStats[k] || 0) + v;
       }
 
-      installs += Number(parts[idxUnits] || 0);
-      uninstalls += Number(parts[idxReturns] || 0);
-      matchedRows++;
+      if (debug) {
+        debugCalls.push({
+          sampleLines: txt.split("\n").slice(0, 5),
+        });
+      }
     }
 
     return json(200, {
       date,
-      appId: appId || null,
+      appId,
       installs,
       uninstalls,
-      source: "salesReports",
-      ...(debug
-        ? {
-            debug: {
-              url,
-              delimiter: delim === "\t" ? "\\t" : ",",
-              header: cols,
-              matchedRows,
-              sampleLines: lines.slice(0, 5),
-            },
-          }
-        : {}),
+      source: "snapshot",
+      ...(debug ? { debugCalls, downloadTypeStats: aggregateDownloadTypeStats } : {}),
     });
-  } catch (e) {
-    return json(500, { date, error: e.message, source: "salesReports" });
+  } catch (err) {
+    return json(500, {
+      error: err.message,
+      ...(debug ? { debugCalls } : {}),
+    });
   }
 };
